@@ -37,6 +37,7 @@ type config struct {
 func main() {
 	start := time.Now()
 	defer func() { log.Printf("Finished after %v", time.Since(start)) }()
+	defer pkg.CloseDiagnostics()
 
 	flags, err := parseFlags()
 	if err != nil {
@@ -55,6 +56,7 @@ func main() {
 		fmt.Println("Target Determinator invocation Error")
 		log.Fatalf("Error during preprocessing: %v", err)
 	}
+	pkg.LogInvocationDiagnostics(config.Context, config.RevisionBefore, config.Targets, config.Verbose)
 
 	seenLabels := make(map[gazelle_label.Label]struct{})
 	callback := func(label gazelle_label.Label, differences []pkg.Difference, configuredTarget *analysis.ConfiguredTarget) {

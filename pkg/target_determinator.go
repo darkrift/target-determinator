@@ -18,6 +18,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/aristanetworks/goarista/path"
 	"github.com/bazel-contrib/target-determinator/common"
@@ -151,6 +152,8 @@ type Context struct {
 
 // FullyProcess returns the before and after metadata maps, with fully filled caches.
 func FullyProcess(context *Context, revBefore LabelledGitRev, revAfter LabelledGitRev, targets TargetsList) (*QueryResults, *QueryResults, error) {
+	logGitDiffDiagnostics(context, revBefore, context.OriginalRevision)
+
 	log.Printf("Processing %s", revBefore)
 	queryInfoBefore, err := fullyProcessRevision(context, revBefore, targets)
 	if err != nil {
@@ -175,12 +178,117 @@ func FullyProcess(context *Context, revBefore LabelledGitRev, revAfter LabelledG
 	return queryInfoBefore, queryInfoAfter, nil
 }
 
+func logGitDiffDiagnostics(context *Context, revBefore LabelledGitRev, revAfter LabelledGitRev) {
+	if revBefore.GitRevision.Sha == "" || revAfter.GitRevision.Sha == "" {
+		log.Printf("Git diff summary skipped: before SHA=%q after SHA=%q", revBefore.GitRevision.Sha, revAfter.GitRevision.Sha)
+		return
+	}
+
+	statuses, err := GitStatusFiltered(context.WorkspacePath, context.IgnoredFiles)
+	if err != nil {
+		log.Printf("Failed to read current git status for diagnostics: %v", err)
+	} else {
+		log.Printf("Current working tree non-ignored status count: %d", len(statuses))
+		if diagnosticsEnabled() {
+			for _, status := range statuses {
+				diagRecord("git_status", map[string]interface{}{
+					"status": status.Status,
+					"path":   status.FilePath.String(),
+				})
+			}
+		}
+	}
+
+	diffRange := revBefore.GitRevision.Sha + ".." + revAfter.GitRevision.Sha
+	diffLines, err := runToLines(context.WorkspacePath, "git", "diff", "--name-status", "--find-renames", diffRange)
+	if err != nil {
+		log.Printf("Failed to compute git diff summary for %s: %v", diffRange, err)
+		diagEvent("git_diff_error", map[string]interface{}{
+			"range": diffRange,
+			"error": err.Error(),
+		})
+		return
+	}
+
+	statusCounts := make(map[string]int)
+	prefixCounts := make(map[string]int)
+	for _, line := range diffLines {
+		if line == "" {
+			continue
+		}
+		fields := strings.Split(line, "\t")
+		status := fields[0]
+		statusKey := status
+		if statusKey != "" {
+			statusKey = statusKey[:1]
+		}
+		statusCounts[statusKey]++
+
+		path := ""
+		oldPath := ""
+		if len(fields) == 2 {
+			path = fields[1]
+		} else if len(fields) >= 3 {
+			oldPath = fields[1]
+			path = fields[2]
+		}
+		prefixCounts[pathPrefixForDiagnostics(path)]++
+		diagRecord("git_diff", map[string]interface{}{
+			"range":    diffRange,
+			"status":   status,
+			"path":     path,
+			"old_path": oldPath,
+		})
+	}
+	log.Printf("Git diff summary %s: files=%d statuses=%v top_prefixes=%v", diffRange, len(diffLines), statusCounts, topStringCounts(prefixCounts, 10))
+	diagEvent("git_diff_summary", map[string]interface{}{
+		"range":        diffRange,
+		"file_count":   len(diffLines),
+		"statuses":     statusCounts,
+		"top_prefixes": topStringCounts(prefixCounts, 20),
+	})
+}
+
+func pathPrefixForDiagnostics(path string) string {
+	if path == "" {
+		return ""
+	}
+	parts := strings.Split(path, "/")
+	if len(parts) > 2 {
+		return strings.Join(parts[:2], "/") + "/..."
+	}
+	return path
+}
+
 // fullyProcessRevision may return a nil error and a non-nil queryInfo.
 // This indicates that evaluating the initial query at this revision failed,
 // but that the user may want to use the results anyway, despite their query results being empty.
 // This may be useful when the "before" commit is broken for query, as it allows for running all
 // matching targets from the "after" query, despite the "before" being broken.
 func fullyProcessRevision(context *Context, rev LabelledGitRev, targets TargetsList) (queryInfo *QueryResults, err error) {
+	start := time.Now()
+	defer func() {
+		fields := map[string]interface{}{
+			"revision": rev.String(),
+			"elapsed":  time.Since(start).String(),
+		}
+		if err != nil {
+			fields["error"] = err.Error()
+		}
+		if queryInfo != nil {
+			fields["bazel_release"] = queryInfo.BazelRelease
+			fields["matching_targets"] = matchingTargetsSummary(queryInfo.MatchingTargets)
+			fields["transitive_targets"] = configuredTargetsSummary(queryInfo.TransitiveConfiguredTargets)
+			if queryInfo.TargetHashCache != nil {
+				fields["computed_hashes"] = queryInfo.TargetHashCache.ComputedHashCount()
+			}
+			log.Printf("Revision summary for %s: matching=%v transitive=%v computed_hashes=%v elapsed=%v",
+				rev, fields["matching_targets"], fields["transitive_targets"], fields["computed_hashes"], fields["elapsed"])
+		} else {
+			log.Printf("Revision summary for %s: no query info elapsed=%v err=%v", rev, fields["elapsed"], err)
+		}
+		diagEvent("revision_finish", fields)
+	}()
 	defer func() {
 		innerErr := gitCheckout(context.WorkspacePath, context.OriginalRevision)
 		if innerErr != nil && err == nil {
@@ -190,6 +298,17 @@ func fullyProcessRevision(context *Context, rev LabelledGitRev, targets TargetsL
 
 	var treeSha string
 	cacheEnabled := context.CacheDirectory != "" && !context.NoCacheResults
+	log.Printf("Revision %s cache eligibility: cache_dir=%q no_cache=%v initial_enabled=%v", rev, context.CacheDirectory, context.NoCacheResults, cacheEnabled)
+	diagEvent("revision_start", map[string]interface{}{
+		"revision":                rev.String(),
+		"workspace_path":          context.WorkspacePath,
+		"target_pattern":          targets.String(),
+		"cache_directory":         context.CacheDirectory,
+		"no_cache_results":        context.NoCacheResults,
+		"cache_initial_enabled":   cacheEnabled,
+		"include_differences":     context.IncludeDifferences,
+		"analysis_cache_strategy": context.AnalysisCacheClearStrategy,
+	})
 	if cacheEnabled && rev.GitRevision == CurrentWorkingCopyState {
 		uncleanStatuses, err := GitStatusFiltered(context.WorkspacePath, context.IgnoredFiles)
 		if err != nil {
@@ -197,6 +316,11 @@ func fullyProcessRevision(context *Context, rev LabelledGitRev, targets TargetsL
 		}
 		if len(uncleanStatuses) > 0 {
 			log.Println("Skipping cache: working copy is unclean")
+			diagEvent("cache_disabled", map[string]interface{}{
+				"revision":       rev.String(),
+				"reason":         "working copy is unclean",
+				"unclean_status": len(uncleanStatuses),
+			})
 			cacheEnabled = false
 		}
 	}
@@ -211,17 +335,35 @@ func fullyProcessRevision(context *Context, rev LabelledGitRev, targets TargetsL
 		if treeErr != nil {
 			return nil, fmt.Errorf("failed to compute tree SHA for %s: %w", rev, treeErr)
 		}
+		log.Printf("Revision %s tree SHA for cache: %s", rev, treeSha)
+		diagEvent("cache_tree_sha", map[string]interface{}{
+			"revision": rev.String(),
+			"tree_sha": treeSha,
+		})
 
 		if context.IncludeDifferences {
 			log.Println("Skipping cache load: -verbose requires full target metadata not stored in cache")
+			diagEvent("cache_load_skipped", map[string]interface{}{
+				"revision": rev.String(),
+				"reason":   "-verbose requires full target metadata",
+			})
 		} else {
 			// Try to load from cache.
 			cachedResults, cacheErr := LoadFromCache(context, treeSha, targets.String())
 			if cacheErr == nil {
 				log.Println("Cache hit: returning cached results")
+				diagEvent("cache_load_hit", map[string]interface{}{
+					"revision": rev.String(),
+					"tree_sha": treeSha,
+				})
 				return cachedResults, nil
 			}
 			log.Printf("Cache load failed: %v", cacheErr)
+			diagEvent("cache_load_miss", map[string]interface{}{
+				"revision": rev.String(),
+				"tree_sha": treeSha,
+				"error":    cacheErr.Error(),
+			})
 		}
 	}
 
@@ -235,11 +377,26 @@ func fullyProcessRevision(context *Context, rev LabelledGitRev, targets TargetsL
 	if err := queryInfo.PrefillCache(); err != nil {
 		return nil, fmt.Errorf("failed to calculate hashes at %s: %w", rev, err)
 	}
+	log.Printf("Hashing complete for %s: computed_hashes=%d", rev, queryInfo.TargetHashCache.ComputedHashCount())
+	diagEvent("hashing_complete", map[string]interface{}{
+		"revision":        rev.String(),
+		"computed_hashes": queryInfo.TargetHashCache.ComputedHashCount(),
+	})
 
 	// Save to cache if caching is enabled
 	if cacheEnabled {
 		if saveErr := SaveToCache(context, treeSha, targets.String(), queryInfo); saveErr != nil {
 			log.Printf("Warning: failed to save to cache: %v", saveErr)
+			diagEvent("cache_save_error", map[string]interface{}{
+				"revision": rev.String(),
+				"tree_sha": treeSha,
+				"error":    saveErr.Error(),
+			})
+		} else {
+			diagEvent("cache_save_success", map[string]interface{}{
+				"revision": rev.String(),
+				"tree_sha": treeSha,
+			})
 		}
 	}
 
@@ -258,6 +415,7 @@ func fullyProcessRevision(context *Context, rev LabelledGitRev, targets TargetsL
 // empty target-set, but may contain other useful information (e.g. the bazel release version).
 // Checking for nil-ness of the error is the true arbiter for whether the entire load was successful.
 func LoadIncompleteMetadata(context *Context, rev LabelledGitRev, targets TargetsList) (*QueryResults, func(), error) {
+	start := time.Now()
 	// Create a temporary context to allow the workspace path to point to a git worktree if necessary.
 	context = &Context{
 		WorkspacePath:                          context.WorkspacePath,
@@ -276,6 +434,14 @@ func LoadIncompleteMetadata(context *Context, rev LabelledGitRev, targets Target
 		NoCacheResults:                         context.NoCacheResults,
 	}
 	cleanupFunc := func() {}
+	log.Printf("Loading incomplete metadata for %s in %s", rev, context.WorkspacePath)
+	diagEvent("metadata_load_start", map[string]interface{}{
+		"revision":        rev.String(),
+		"workspace_path":  context.WorkspacePath,
+		"target_pattern":  targets.String(),
+		"using_worktree":  false,
+		"delete_worktree": context.DeleteCachedWorktree,
+	})
 
 	if rev.GitRevision != CurrentWorkingCopyState {
 		// This may return a new workspace path to ensure we don't destroy any local data.
@@ -292,6 +458,13 @@ func LoadIncompleteMetadata(context *Context, rev LabelledGitRev, targets Target
 			}
 			context.WorkspacePath = newWorkspacePath
 		}
+		if newWorkspacePath != "" {
+			log.Printf("Metadata load for %s using git worktree %s", rev, newWorkspacePath)
+			diagEvent("metadata_worktree", map[string]interface{}{
+				"revision":      rev.String(),
+				"worktree_path": newWorkspacePath,
+			})
+		}
 
 		if err2 != nil {
 			return nil, cleanupFunc, fmt.Errorf("failed to checkout %s in %v: %w", rev, context.WorkspacePath, err2)
@@ -300,6 +473,7 @@ func LoadIncompleteMetadata(context *Context, rev LabelledGitRev, targets Target
 
 	var queryInfoBeforeClear *QueryResults
 	if context.CompareQueriesAroundAnalysisCacheClear {
+		log.Printf("Running pre-clear comparison query for %s", rev)
 		var err error
 		queryInfoBeforeClear, err = doQueryDeps(context, targets)
 		if err != nil {
@@ -325,8 +499,19 @@ func LoadIncompleteMetadata(context *Context, rev LabelledGitRev, targets Target
 		if !reflect.DeepEqual(queryInfoBeforeClear.TransitiveConfiguredTargets, queryInfo.TransitiveConfiguredTargets) {
 			return nil, cleanupFunc, fmt.Errorf("inconsistent cquery results before and after analysis cache clear: TransitiveConfiguredTargets")
 		}
+		log.Printf("Pre-clear and post-clear cquery results matched for %s", rev)
 	}
 
+	log.Printf("Loaded incomplete metadata for %s in %v", rev, time.Since(start))
+	diagEvent("metadata_load_finish", map[string]interface{}{
+		"revision":        rev.String(),
+		"workspace_path":  context.WorkspacePath,
+		"elapsed":         time.Since(start).String(),
+		"matching":        matchingTargetsSummary(queryInfo.MatchingTargets),
+		"transitive":      configuredTargetsSummary(queryInfo.TransitiveConfiguredTargets),
+		"bazel_release":   queryInfo.BazelRelease,
+		"query_had_error": queryInfo.QueryError != nil,
+	})
 	return queryInfo, cleanupFunc, nil
 }
 
@@ -590,6 +775,7 @@ type QueryResults struct {
 }
 
 func (queryInfo *QueryResults) PrefillCache() error {
+	start := time.Now()
 	var err error
 	var numWorkers int
 	workerCountEnv := os.Getenv("TD_WORKER_COUNT")
@@ -601,6 +787,17 @@ func (queryInfo *QueryResults) PrefillCache() error {
 			return fmt.Errorf("could not parse the TD_WORKER_COUNT env var into an int: %v", workerCountEnv)
 		}
 	}
+	totalConfiguredTargets := 0
+	for _, l := range queryInfo.MatchingTargets.Labels() {
+		totalConfiguredTargets += len(queryInfo.MatchingTargets.ConfigurationsFor(l))
+	}
+	log.Printf("Prefilling target hash cache: matching_labels=%d matching_configured_targets=%d workers=%d",
+		len(queryInfo.MatchingTargets.Labels()), totalConfiguredTargets, numWorkers)
+	diagEvent("hash_prefill_start", map[string]interface{}{
+		"matching":                    matchingTargetsSummary(queryInfo.MatchingTargets),
+		"worker_count":                numWorkers,
+		"matching_configured_targets": totalConfiguredTargets,
+	})
 
 	// Create a thread pool to hash the targets faster.
 	labelAndConfigurationsChan := make(chan LabelAndConfiguration, numWorkers)
@@ -639,13 +836,24 @@ OUTER:
 	wg.Wait()
 
 	if len(errorsChan) > 0 {
-		return <-errorsChan
+		err := <-errorsChan
+		diagEvent("hash_prefill_error", map[string]interface{}{
+			"elapsed":         time.Since(start).String(),
+			"computed_hashes": queryInfo.TargetHashCache.ComputedHashCount(),
+			"error":           err.Error(),
+		})
+		return err
 	}
 
 	// We may be about to change the filesystem state, which will mean any file reads done after
 	// this point may be invalid.
 	// We freeze the TargetHashCache to ensure it will not allow further reads after this point.
 	queryInfo.TargetHashCache.Freeze()
+	log.Printf("Prefilled target hash cache: computed_hashes=%d elapsed=%v", queryInfo.TargetHashCache.ComputedHashCount(), time.Since(start))
+	diagEvent("hash_prefill_finish", map[string]interface{}{
+		"elapsed":         time.Since(start).String(),
+		"computed_hashes": queryInfo.TargetHashCache.ComputedHashCount(),
+	})
 	return nil
 }
 
@@ -660,6 +868,15 @@ type LabelAndConfiguration struct {
 }
 
 func clearAnalysisCache(context *Context) error {
+	start := time.Now()
+	log.Printf("Analysis cache clear strategy: %s", context.AnalysisCacheClearStrategy)
+	defer func() {
+		diagEvent("analysis_cache_clear", map[string]interface{}{
+			"strategy":       context.AnalysisCacheClearStrategy,
+			"workspace_path": context.WorkspacePath,
+			"elapsed":        time.Since(start).String(),
+		})
+	}()
 	if context.AnalysisCacheClearStrategy == "skip" {
 		return nil
 	} else if context.AnalysisCacheClearStrategy == "shutdown" {
@@ -745,10 +962,17 @@ func NormalizeConfiguredTarget(target *analysis.ConfiguredTarget, n *Normalizer)
 // empty target-set, but may contain other useful information (e.g. the bazel release version).
 // Checking for nil-ness of the error is the true arbiter for whether the entire query was successful.
 func doQueryDeps(context *Context, targets TargetsList) (*QueryResults, error) {
+	start := time.Now()
 	bazelRelease, err := BazelRelease(context.WorkspacePath, context.BazelCmd)
 	if err != nil {
 		return nil, fmt.Errorf("failed to resolve the bazel release: %w", err)
 	}
+	log.Printf("Resolved Bazel release in %s: %s", context.WorkspacePath, bazelRelease)
+	diagEvent("query_start", map[string]interface{}{
+		"workspace_path": context.WorkspacePath,
+		"target_pattern": targets.String(),
+		"bazel_release":  bazelRelease,
+	})
 
 	// The `bazel mod dump_repo_mapping` subcommand was added in Bazel 7.1.2.
 	canRetrieveMapping, _ := versions.ReleaseIsInRange(bazelRelease, version.Must(version.NewVersion("7.1.2")), nil)
@@ -757,6 +981,7 @@ func doQueryDeps(context *Context, targets TargetsList) (*QueryResults, error) {
 	if err != nil {
 		return nil, fmt.Errorf("failed to determine if bzlmod is enabled: %w", err)
 	}
+	log.Printf("Bzlmod enabled in %s: %v", context.WorkspacePath, hasBzlmod)
 
 	var repoMapping map[string]string
 	if hasBzlmod && (canRetrieveMapping != nil && *canRetrieveMapping) {
@@ -768,6 +993,13 @@ func doQueryDeps(context *Context, targets TargetsList) (*QueryResults, error) {
 	} else {
 		repoMapping = map[string]string{}
 	}
+	log.Printf("Repository mapping entries: %d", len(repoMapping))
+	diagEvent("repo_mapping", map[string]interface{}{
+		"workspace_path":       context.WorkspacePath,
+		"has_bzlmod":           hasBzlmod,
+		"can_retrieve_mapping": canRetrieveMapping != nil && *canRetrieveMapping,
+		"mapping_entries":      len(repoMapping),
+	})
 
 	normalizer := Normalizer{repoMapping}
 
@@ -782,6 +1014,7 @@ func doQueryDeps(context *Context, targets TargetsList) (*QueryResults, error) {
 		if err != nil {
 			return nil, fmt.Errorf("failed to find incompatible targets: %w", err)
 		}
+		log.Printf("Incompatible targets filtered from deps query: %d", len(incompatibleTargetsToFilter))
 	} else if hasIncompatibleTargetsBug == nil {
 		log.Printf("Couldn't detect whether current bazel version (%s) suffers from https://github.com/bazelbuild/bazel/issues/21010: %s - assuming it does not", bazelRelease, explanation)
 	}
@@ -809,17 +1042,26 @@ func doQueryDeps(context *Context, targets TargetsList) (*QueryResults, error) {
 	if err != nil {
 		return nil, fmt.Errorf("failed to parse cquery result: %w", err)
 	}
+	log.Printf("Transitive cquery parsed: raw_results=%d summary=%v", len(transitiveResult), configuredTargetsSummary(transitiveConfiguredTargets))
+	diagEvent("transitive_cquery_parsed", map[string]interface{}{
+		"workspace_path": context.WorkspacePath,
+		"pattern":        depsPattern,
+		"raw_results":    len(transitiveResult),
+		"summary":        configuredTargetsSummary(transitiveConfiguredTargets),
+	})
 
 	matchingTargetResults, err := runToCqueryResult(context, targets.String(), false, bazelRelease)
 	if err != nil {
 		return nil, fmt.Errorf("failed to run top-level cquery: %w", err)
 	}
+	log.Printf("Top-level cquery raw results: %d", len(matchingTargetResults))
 
 	var compatibleTargets map[label.Label]bool
 	if context.FilterIncompatibleTargets {
 		if compatibleTargets, err = findCompatibleTargets(context, targets.String(), true, &normalizer, bazelRelease); err != nil {
 			return nil, fmt.Errorf("failed to find compatible targets: %w", err)
 		}
+		log.Printf("Compatible top-level targets: %d", len(compatibleTargets))
 	}
 	// Need to do this due to a change in bazel-gazelle & how equality between labels is determined.
 	// Likely happened in https://github.com/bazel-contrib/bazel-gazelle/pull/1911.
@@ -854,11 +1096,19 @@ func doQueryDeps(context *Context, targets TargetsList) (*QueryResults, error) {
 		labels:                 ss.NewSortedSetFn(labels, CompareLabels),
 		labelsToConfigurations: processedLabelsToConfigurations,
 	}
+	log.Printf("Top-level matching targets summary: %v", matchingTargetsSummary(matchingTargets))
+	diagEvent("matching_targets", map[string]interface{}{
+		"workspace_path": context.WorkspacePath,
+		"pattern":        targets.String(),
+		"raw_results":    len(matchingTargetResults),
+		"summary":        matchingTargetsSummary(matchingTargets),
+	})
 
 	configurations, err := getConfigurationDetails(context)
 	if err != nil {
 		return nil, fmt.Errorf("failed to interpret configurations output: %w", err)
 	}
+	log.Printf("Configuration detail entries: %d", len(configurations))
 
 	queryResults := &QueryResults{
 		MatchingTargets:             matchingTargets,
@@ -868,6 +1118,18 @@ func doQueryDeps(context *Context, targets TargetsList) (*QueryResults, error) {
 		QueryError:                  nil,
 		configurations:              configurations,
 	}
+	log.Printf("Query finished in %v for %s", time.Since(start), context.WorkspacePath)
+	diagEvent("query_finish", map[string]interface{}{
+		"workspace_path":        context.WorkspacePath,
+		"target_pattern":        targets.String(),
+		"elapsed":               time.Since(start).String(),
+		"bazel_release":         bazelRelease,
+		"matching_summary":      matchingTargetsSummary(matchingTargets),
+		"transitive_summary":    configuredTargetsSummary(transitiveConfiguredTargets),
+		"configuration_count":   len(configurations),
+		"compatible_count":      len(compatibleTargets),
+		"incompatible_filtered": len(incompatibleTargetsToFilter),
+	})
 	return queryResults, nil
 }
 
@@ -882,6 +1144,7 @@ func sortedStringKeys[V any](m map[label.Label]V) []string {
 
 func runToCqueryResult(context *Context, pattern string, includeTransitions bool, bazelRelease string) ([]*analysis.ConfiguredTarget, error) {
 	log.Printf("Running cquery on %s", pattern)
+	start := time.Now()
 	var stdout bytes.Buffer
 	var stderr bytes.Buffer
 
@@ -903,9 +1166,48 @@ func runToCqueryResult(context *Context, pattern string, includeTransitions bool
 		BazelCmdConfig{Dir: context.WorkspacePath, Stdout: &stdout, Stderr: &stderr},
 		[]string{"--output_base", context.BazelOutputBase},
 		args...)
+	stdoutBytes := stdout.Len()
+	stderrString := stderr.String()
 
 	if returnVal != 0 || err != nil {
+		diagEvent("cquery_error", map[string]interface{}{
+			"workspace_path":          context.WorkspacePath,
+			"pattern":                 pattern,
+			"include_transitions":     includeTransitions,
+			"args":                    args,
+			"return_code":             returnVal,
+			"error":                   fmt.Sprintf("%v", err),
+			"elapsed":                 time.Since(start).String(),
+			"stdout_bytes":            stdoutBytes,
+			"stderr_bytes":            len(stderrString),
+			"stderr_tail":             tailForDiagnostics(stderrString, 8192),
+			"used_streamed_proto":     useStreamedProto,
+			"bazel_release":           bazelRelease,
+			"bazel_output_base":       context.BazelOutputBase,
+			"analysis_cache_strategy": context.AnalysisCacheClearStrategy,
+		})
 		return nil, fmt.Errorf("failed to run cquery on %s: %w. Stderr:\n%v", pattern, err, stderr.String())
+	}
+
+	recordSuccess := func(targetCount int) {
+		log.Printf("Cquery finished pattern=%q include_transitions=%v results=%d stdout_bytes=%d stderr_bytes=%d elapsed=%v",
+			pattern, includeTransitions, targetCount, stdoutBytes, len(stderrString), time.Since(start))
+		diagEvent("cquery_success", map[string]interface{}{
+			"workspace_path":          context.WorkspacePath,
+			"pattern":                 pattern,
+			"include_transitions":     includeTransitions,
+			"args":                    args,
+			"return_code":             returnVal,
+			"elapsed":                 time.Since(start).String(),
+			"result_count":            targetCount,
+			"stdout_bytes":            stdoutBytes,
+			"stderr_bytes":            len(stderrString),
+			"stderr_tail":             tailForDiagnostics(stderrString, 8192),
+			"used_streamed_proto":     useStreamedProto,
+			"bazel_release":           bazelRelease,
+			"bazel_output_base":       context.BazelOutputBase,
+			"analysis_cache_strategy": context.AnalysisCacheClearStrategy,
+		})
 	}
 
 	if useStreamedProto {
@@ -916,22 +1218,41 @@ func runToCqueryResult(context *Context, pattern string, includeTransitions bool
 			if err = unmarshalOpts.UnmarshalFrom(&stdout, &singleTargetResult); err == io.EOF {
 				break
 			} else if err != nil {
+				diagEvent("cquery_parse_error", map[string]interface{}{
+					"workspace_path":      context.WorkspacePath,
+					"pattern":             pattern,
+					"include_transitions": includeTransitions,
+					"error":               err.Error(),
+					"stdout_bytes":        stdoutBytes,
+					"used_streamed_proto": useStreamedProto,
+				})
 				return nil, fmt.Errorf("failed to unmarshal streamed cquery stdout: %w", err)
 			}
 			targets = append(targets, singleTargetResult.Results...)
 		}
+		recordSuccess(len(targets))
 		return targets, nil
 	} else {
 		var result analysis.CqueryResult
 		if err = proto.Unmarshal(stdout.Bytes(), &result); err != nil {
+			diagEvent("cquery_parse_error", map[string]interface{}{
+				"workspace_path":      context.WorkspacePath,
+				"pattern":             pattern,
+				"include_transitions": includeTransitions,
+				"error":               err.Error(),
+				"stdout_bytes":        stdoutBytes,
+				"used_streamed_proto": useStreamedProto,
+			})
 			return nil, fmt.Errorf("failed to unmarshal cquery stdout: %w", err)
 		}
+		recordSuccess(len(result.GetResults()))
 		return result.GetResults(), nil
 	}
 }
 
 func findCompatibleTargets(context *Context, pattern string, compatibility bool, n *Normalizer, bazelRelease string) (map[label.Label]bool, error) {
 	log.Printf("Finding compatible targets under %s", pattern)
+	start := time.Now()
 	compatibleTargets := make(map[label.Label]bool)
 
 	// Add the `or []` to work around https://github.com/bazelbuild/bazel/issues/17749 which was fixed in 6.2.0.
@@ -956,9 +1277,20 @@ func findCompatibleTargets(context *Context, pattern string, compatibility bool,
 		if returnVal != 0 || err != nil {
 			return nil, fmt.Errorf("failed to run compatibility-filtering cquery on %s: %w. Stderr:\n%v", pattern, err, stderr.String())
 		}
+		stdoutBytes := stdout.Len()
 		if err := addCompatibleTargetsLines(&stdout, compatibleTargets, n); err != nil {
 			return nil, err
 		}
+		diagEvent("compatibility_cquery", map[string]interface{}{
+			"workspace_path": context.WorkspacePath,
+			"pattern":        pattern,
+			"compatibility":  compatibility,
+			"alias_query":    false,
+			"target_count":   len(compatibleTargets),
+			"stdout_bytes":   stdoutBytes,
+			"stderr_bytes":   stderr.Len(),
+			"stderr_tail":    tailForDiagnostics(stderr.String(), 8192),
+		})
 	}
 
 	{
@@ -976,10 +1308,29 @@ func findCompatibleTargets(context *Context, pattern string, compatibility bool,
 		if returnVal != 0 || err != nil {
 			return nil, fmt.Errorf("failed to run alias compatibility-filtering cquery on %s: %w. Stderr:\n%v", pattern, err, stderr.String())
 		}
+		stdoutBytes := stdout.Len()
 		if err := addCompatibleTargetsLines(&stdout, compatibleTargets, n); err != nil {
 			return nil, err
 		}
+		diagEvent("compatibility_cquery", map[string]interface{}{
+			"workspace_path": context.WorkspacePath,
+			"pattern":        pattern,
+			"compatibility":  compatibility,
+			"alias_query":    true,
+			"target_count":   len(compatibleTargets),
+			"stdout_bytes":   stdoutBytes,
+			"stderr_bytes":   stderr.Len(),
+			"stderr_tail":    tailForDiagnostics(stderr.String(), 8192),
+		})
 	}
+	log.Printf("Compatibility query finished pattern=%q compatibility=%v targets=%d elapsed=%v", pattern, compatibility, len(compatibleTargets), time.Since(start))
+	diagEvent("compatibility_summary", map[string]interface{}{
+		"workspace_path": context.WorkspacePath,
+		"pattern":        pattern,
+		"compatibility":  compatibility,
+		"target_count":   len(compatibleTargets),
+		"elapsed":        time.Since(start).String(),
+	})
 	return compatibleTargets, nil
 }
 
@@ -1038,6 +1389,7 @@ func runToLines(workingDirectory string, arg0 string, args ...string) ([]string,
 
 func ParseCqueryResult(targets []*analysis.ConfiguredTarget, n *Normalizer) (map[label.Label]map[Configuration]*analysis.ConfiguredTarget, error) {
 	configuredTargets := make(map[label.Label]map[Configuration]*analysis.ConfiguredTarget, len(targets))
+	duplicateCount := 0
 
 	for _, target := range targets {
 		l, err := labelOf(target.GetTarget(), n)
@@ -1052,9 +1404,31 @@ func ParseCqueryResult(targets []*analysis.ConfiguredTarget, n *Normalizer) (map
 
 		NormalizeConfiguredTarget(target, n)
 
-		configuredTargets[l][NormalizeConfiguration(target.GetConfiguration().GetChecksum())] = target
+		configuration := NormalizeConfiguration(target.GetConfiguration().GetChecksum())
+		if previous, ok := configuredTargets[l][configuration]; ok {
+			duplicateCount++
+			if duplicateCount <= diagIntEnv("TD_DEBUG_DUPLICATE_RECORD_LIMIT", 50) {
+				diagRecord("duplicate_configured_targets", map[string]interface{}{
+					"label":                  l.String(),
+					"configuration":          configString(configuration),
+					"previous_target":        configuredTargetDiagnostic(previous),
+					"replacement_target":     configuredTargetDiagnostic(target),
+					"previous_proto_hash":    stableProtoDigest(previous.GetTarget()),
+					"replacement_proto_hash": stableProtoDigest(target.GetTarget()),
+				})
+			}
+		}
+		configuredTargets[l][configuration] = target
 	}
 
+	if duplicateCount > 0 {
+		log.Printf("Parsed cquery result with duplicate configured target entries: %d", duplicateCount)
+	}
+	diagEvent("parse_cquery_result", map[string]interface{}{
+		"raw_results":       len(targets),
+		"summary":           configuredTargetsSummary(configuredTargets),
+		"duplicate_entries": duplicateCount,
+	})
 	return configuredTargets, nil
 }
 

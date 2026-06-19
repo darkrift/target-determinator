@@ -94,7 +94,16 @@ func ComputeCacheKey(context *Context, gitSHA string, targetPattern string) (str
 	// Hash the key
 	hasher := sha256.New()
 	hasher.Write(keyJSON)
-	return hex.EncodeToString(hasher.Sum(nil)), nil
+	cacheKey := hex.EncodeToString(hasher.Sum(nil))
+	diagRecord("cache_keys", map[string]interface{}{
+		"cache_key":      cacheKey,
+		"git_tree_sha":   gitSHA,
+		"target_pattern": targetPattern,
+		"bazel_version":  bazelRelease,
+		"context":        contextKey,
+		"binary_hash":    binaryHash,
+	})
+	return cacheKey, nil
 }
 
 // collectCacheContextFields returns a map of the Context fields that affect the cache key
@@ -147,6 +156,12 @@ func LoadFromCache(context *Context, treeSHA string, targetPattern string) (*Que
 	cacheItemPath := filepath.Join(context.CacheDirectory, configuredTargetCacheDirname, cacheKey)
 
 	log.Printf("Attempting to load from cache: %s", cacheItemPath)
+	diagEvent("cache_load_attempt", map[string]interface{}{
+		"cache_key":       cacheKey,
+		"cache_item_path": cacheItemPath,
+		"tree_sha":        treeSHA,
+		"target_pattern":  targetPattern,
+	})
 
 	data, err := os.ReadFile(cacheItemPath)
 	if err != nil {
@@ -183,6 +198,13 @@ func LoadFromCache(context *Context, treeSHA string, targetPattern string) (*Que
 	}
 
 	log.Printf("Cache hit! Loaded results from cache")
+	diagEvent("cache_load_success", map[string]interface{}{
+		"cache_key":      cacheKey,
+		"tree_sha":       treeSHA,
+		"target_pattern": targetPattern,
+		"matching":       matchingTargetsSummary(matchingTargets),
+		"hash_count":     len(serialized.PrecomputedHashes),
+	})
 	return queryResults, nil
 }
 
@@ -249,6 +271,15 @@ func SaveToCache(context *Context, gitSHA string, targetPattern string, queryRes
 	tmpPath = ""
 
 	log.Printf("Saved results to cache: %s", cacheItemPath)
+	diagEvent("cache_save", map[string]interface{}{
+		"cache_key":      cacheKey,
+		"tree_sha":       gitSHA,
+		"target_pattern": targetPattern,
+		"cache_path":     cacheItemPath,
+		"matching":       matchingTargetsSummary(queryResults.MatchingTargets),
+		"hash_count":     len(serialized.PrecomputedHashes),
+		"bytes":          len(data),
+	})
 	return nil
 }
 

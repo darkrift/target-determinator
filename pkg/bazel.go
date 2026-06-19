@@ -6,8 +6,10 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"os"
 	"os/exec"
+	"time"
 
 	"github.com/bazel-contrib/target-determinator/common/versions"
 	"github.com/hashicorp/go-version"
@@ -74,7 +76,8 @@ func (c DefaultBazelCmd) HashKey() string {
 
 // Execute calls bazel with the provided arguments.
 // It returns the exit status code or -1 if it errored before the process could start.
-func (c DefaultBazelCmd) Execute(config BazelCmdConfig, startupArgs []string, command string, args ...string) (int, error) {
+func (c DefaultBazelCmd) Execute(config BazelCmdConfig, startupArgs []string, command string, args ...string) (exitCode int, err error) {
+	start := time.Now()
 	bazelArgv := make([]string, 0, len(c.BazelStartupOpts)+len(args))
 	bazelArgv = append(bazelArgv, c.BazelStartupOpts...)
 	bazelArgv = append(bazelArgv, startupArgs...)
@@ -88,14 +91,36 @@ func (c DefaultBazelCmd) Execute(config BazelCmdConfig, startupArgs []string, co
 	cmd.Stdout = config.Stdout
 	cmd.Stderr = config.Stderr
 
-	if err := cmd.Run(); err != nil {
+	log.Printf("Running Bazel command: dir=%s argv=%q", config.Dir, append([]string{c.BazelPath}, bazelArgv...))
+	defer func() {
+		fields := map[string]interface{}{
+			"dir":          config.Dir,
+			"argv":         append([]string{c.BazelPath}, bazelArgv...),
+			"command":      command,
+			"exit_code":    exitCode,
+			"elapsed":      time.Since(start).String(),
+			"bazel_path":   c.BazelPath,
+			"bazel_opts":   c.BazelOpts,
+			"startup_opts": c.BazelStartupOpts,
+		}
+		if err != nil {
+			fields["error"] = err.Error()
+		}
+		diagEvent("bazel_execute", fields)
+		log.Printf("Bazel command finished: command=%s exit=%d elapsed=%v err=%v", command, exitCode, time.Since(start), err)
+	}()
+
+	if err = cmd.Run(); err != nil {
 		if exitError, ok := err.(*exec.ExitError); ok {
-			return exitError.ExitCode(), err
+			exitCode = exitError.ExitCode()
+			return exitCode, err
 		} else {
-			return -1, err
+			exitCode = -1
+			return exitCode, err
 		}
 	}
-	return 0, nil
+	exitCode = 0
+	return exitCode, nil
 }
 
 // Cquery calls bazel cquery with the provided arguments, using an output file if supported.

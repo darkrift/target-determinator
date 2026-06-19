@@ -166,6 +166,22 @@ func (thc *TargetHashCache) ExtractHashes() map[string][]byte {
 	return result
 }
 
+func (thc *TargetHashCache) ComputedHashCount() int {
+	count := 0
+	thc.cacheLock.Lock()
+	defer thc.cacheLock.Unlock()
+	for _, configMap := range thc.cache {
+		for _, entry := range configMap {
+			entry.hashLock.Lock()
+			if entry.hash != nil {
+				count++
+			}
+			entry.hashLock.Unlock()
+		}
+	}
+	return count
+}
+
 // RestoreHashes populates the cache with pre-computed hashes and freezes the cache.
 // Keys must be formatted as "<label>\x00<configuration>".
 func (thc *TargetHashCache) RestoreHashes(hashes map[string][]byte) error {
