@@ -8,6 +8,11 @@ import (
 	"testing"
 
 	"github.com/bazel-contrib/target-determinator/common"
+	ss "github.com/bazel-contrib/target-determinator/common/sorted_set"
+	"github.com/bazel-contrib/target-determinator/third_party/protobuf/bazel/analysis"
+	"github.com/bazel-contrib/target-determinator/third_party/protobuf/bazel/build"
+	gazelle_label "github.com/bazelbuild/bazel-gazelle/label"
+	"google.golang.org/protobuf/proto"
 )
 
 func Test_stringSliceContainsStartingWith(t *testing.T) {
@@ -166,6 +171,177 @@ func TestGitSafeCheckoutRestoresOriginalAfterPostCheckoutDirtyWorktreeFallback(t
 	if _, err := os.Stat(filepath.Join(repo, "ignored-file")); err != nil {
 		t.Fatalf("ignored file was not preserved in primary checkout: %v", err)
 	}
+}
+
+func TestMetadataAndSourceChangesProveNoAffectedTargets(t *testing.T) {
+	workspace := t.TempDir()
+	matchingTarget := mustParseLabel("//pkg:test")
+	config := NormalizeConfiguration("cfg")
+	sourceFile := "pkg/source.txt"
+	fingerprints := map[string][]byte{
+		"//pkg:test\x00cfg": []byte("same"),
+	}
+
+	for _, tt := range []struct {
+		name              string
+		changedPaths      []string
+		beforeRelease     string
+		afterRelease      string
+		beforeTargets     []gazelle_label.Label
+		afterTargets      []gazelle_label.Label
+		beforeFingerprint []byte
+		afterFingerprint  []byte
+		want              bool
+	}{
+		{
+			name:              "changed file outside transitive source graph",
+			changedPaths:      []string{"README.md"},
+			beforeRelease:     "release 7.0.0",
+			afterRelease:      "release 7.0.0",
+			beforeTargets:     []gazelle_label.Label{matchingTarget},
+			afterTargets:      []gazelle_label.Label{matchingTarget},
+			beforeFingerprint: []byte("same"),
+			afterFingerprint:  []byte("same"),
+			want:              true,
+		},
+		{
+			name:              "changed source file in transitive source graph",
+			changedPaths:      []string{sourceFile},
+			beforeRelease:     "release 7.0.0",
+			afterRelease:      "release 7.0.0",
+			beforeTargets:     []gazelle_label.Label{matchingTarget},
+			afterTargets:      []gazelle_label.Label{matchingTarget},
+			beforeFingerprint: []byte("same"),
+			afterFingerprint:  []byte("same"),
+			want:              false,
+		},
+		{
+			name:              "changed source file parent directory",
+			changedPaths:      []string{"pkg"},
+			beforeRelease:     "release 7.0.0",
+			afterRelease:      "release 7.0.0",
+			beforeTargets:     []gazelle_label.Label{matchingTarget},
+			afterTargets:      []gazelle_label.Label{matchingTarget},
+			beforeFingerprint: []byte("same"),
+			afterFingerprint:  []byte("same"),
+			want:              false,
+		},
+		{
+			name:              "changed build metadata",
+			changedPaths:      []string{"pkg/BUILD.bazel"},
+			beforeRelease:     "release 7.0.0",
+			afterRelease:      "release 7.0.0",
+			beforeTargets:     []gazelle_label.Label{matchingTarget},
+			afterTargets:      []gazelle_label.Label{matchingTarget},
+			beforeFingerprint: []byte("same"),
+			afterFingerprint:  []byte("same"),
+			want:              false,
+		},
+		{
+			name:              "matching targets differ",
+			changedPaths:      []string{"README.md"},
+			beforeRelease:     "release 7.0.0",
+			afterRelease:      "release 7.0.0",
+			beforeTargets:     []gazelle_label.Label{matchingTarget},
+			afterTargets:      []gazelle_label.Label{mustParseLabel("//pkg:other_test")},
+			beforeFingerprint: []byte("same"),
+			afterFingerprint:  []byte("same"),
+			want:              false,
+		},
+		{
+			name:              "semantic metadata differs",
+			changedPaths:      []string{"README.md"},
+			beforeRelease:     "release 7.0.0",
+			afterRelease:      "release 7.0.0",
+			beforeTargets:     []gazelle_label.Label{matchingTarget},
+			afterTargets:      []gazelle_label.Label{matchingTarget},
+			beforeFingerprint: []byte("before"),
+			afterFingerprint:  []byte("after"),
+			want:              false,
+		},
+		{
+			name:              "bazel release differs",
+			changedPaths:      []string{"README.md"},
+			beforeRelease:     "release 7.0.0",
+			afterRelease:      "release 7.1.0",
+			beforeTargets:     []gazelle_label.Label{matchingTarget},
+			afterTargets:      []gazelle_label.Label{matchingTarget},
+			beforeFingerprint: []byte("same"),
+			afterFingerprint:  []byte("same"),
+			want:              false,
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			beforeFingerprints := copyFingerprintMap(fingerprints)
+			beforeFingerprints["//pkg:test\x00cfg"] = tt.beforeFingerprint
+			afterFingerprints := copyFingerprintMap(fingerprints)
+			afterFingerprints["//pkg:test\x00cfg"] = tt.afterFingerprint
+
+			before := queryResultsForFastPathTest(t, workspace, tt.beforeRelease, tt.beforeTargets, config, sourceFile, beforeFingerprints)
+			after := queryResultsForFastPathTest(t, workspace, tt.afterRelease, tt.afterTargets, config, sourceFile, afterFingerprints)
+
+			got := metadataAndSourceChangesProveNoAffectedTargets(before, after, NewChangedPathSet(tt.changedPaths))
+			if got != tt.want {
+				t.Fatalf("metadataAndSourceChangesProveNoAffectedTargets() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+func queryResultsForFastPathTest(
+	t *testing.T,
+	workspace string,
+	bazelRelease string,
+	matchingTargets []gazelle_label.Label,
+	config Configuration,
+	sourceFile string,
+	metadataFingerprints map[string][]byte,
+) *QueryResults {
+	t.Helper()
+
+	n := Normalizer{}
+	targetHashCache := NewTargetHashCache(nil, &n, bazelRelease)
+	targetHashCache.SetWorkspacePath(workspace)
+	targetHashCache.RestoreMetadataFingerprints(metadataFingerprints)
+
+	sourceLabel := mustParseLabel("//pkg:source.txt")
+	return &QueryResults{
+		MatchingTargets: matchingTargetsForTest(matchingTargets, config),
+		TransitiveConfiguredTargets: map[gazelle_label.Label]map[Configuration]*analysis.ConfiguredTarget{
+			sourceLabel: {
+				NormalizeConfiguration(""): {
+					Target: &build.Target{
+						Type: build.Target_SOURCE_FILE.Enum(),
+						SourceFile: &build.SourceFile{
+							Name:     proto.String(sourceLabel.String()),
+							Location: proto.String(filepath.Join(workspace, sourceFile) + ":1:1"),
+						},
+					},
+				},
+			},
+		},
+		TargetHashCache: targetHashCache,
+		BazelRelease:    bazelRelease,
+	}
+}
+
+func matchingTargetsForTest(labels []gazelle_label.Label, config Configuration) *MatchingTargets {
+	labelsToConfigurations := make(map[gazelle_label.Label]*ss.SortedSet[Configuration], len(labels))
+	for _, l := range labels {
+		labelsToConfigurations[l] = ss.NewSortedSetFn([]Configuration{config}, ConfigurationLess)
+	}
+	return &MatchingTargets{
+		labels:                 ss.NewSortedSetFn(labels, CompareLabels),
+		labelsToConfigurations: labelsToConfigurations,
+	}
+}
+
+func copyFingerprintMap(fingerprints map[string][]byte) map[string][]byte {
+	result := make(map[string][]byte, len(fingerprints))
+	for key, value := range fingerprints {
+		result[key] = copyBytes(value)
+	}
+	return result
 }
 
 func runGit(t *testing.T, dir string, args ...string) string {
