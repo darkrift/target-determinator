@@ -709,6 +709,7 @@ func gitStatus(workingDirectory string) ([]GitFileStatus, error) {
 //
 // When applicable, the caller is responsible for cleaning up the newly created worktree.
 func gitSafeCheckout(context *Context, rev LabelledGitRev, ignoredFiles []common.RelPath) (string, error) {
+	originalWorkspacePath := context.WorkspacePath
 	isPreCheckoutClean, err := EnsureGitRepositoryClean(context.WorkspacePath, ignoredFiles)
 	if err != nil {
 		return "", fmt.Errorf("failed to check whether the repository is clean: %w", err)
@@ -738,7 +739,14 @@ func gitSafeCheckout(context *Context, rev LabelledGitRev, ignoredFiles []common
 
 		log.Printf("Detected unclean repository after checkout (likely due to submodule or " +
 			".gitignore changes). Using git worktree to leave original repository pristine.")
-		return checkoutWorktree(context, rev)
+		newWorkspacePath, err := checkoutWorktree(context, rev)
+		if err != nil {
+			return newWorkspacePath, err
+		}
+		if err := gitCheckout(originalWorkspacePath, context.OriginalRevision); err != nil {
+			return newWorkspacePath, fmt.Errorf("failed to restore original repository after creating worktree for %v: %w", rev, err)
+		}
+		return newWorkspacePath, nil
 	}
 
 	return updateSubmodules(context.WorkspacePath, rev, "")

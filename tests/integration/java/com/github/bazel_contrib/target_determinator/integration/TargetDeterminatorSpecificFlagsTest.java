@@ -9,6 +9,7 @@ import java.util.Set;
 import java.util.stream.Collectors;
 import java.util.stream.Stream;
 
+import org.eclipse.jgit.api.Git;
 import org.eclipse.jgit.util.FileUtils;
 import org.hamcrest.CoreMatchers;
 import org.junit.After;
@@ -203,6 +204,21 @@ public class TargetDeterminatorSpecificFlagsTest {
     Util.assertTargetsMatch(targets, Set.of(), Set.of(), false);
   }
 
+  @Test
+  public void optimizedExecutionMatchesFullHashingBehavior() throws Exception {
+    assertOptimizedMatchesFullHashingAfterLocalCommit(
+        this::commitModifiedExampleTest,
+        "//java/example:ExampleTest",
+        Set.of("//java/example:ExampleTest"),
+        "Hash prefill fast path disabled: changed files intersect transitive source graph");
+
+    assertOptimizedMatchesFullHashingAfterLocalCommit(
+        this::commitUnusedFile,
+        "//java/example:ExampleTest",
+        Set.of(),
+        "Skipping hash prefill: cquery metadata is unchanged and changed files are outside the transitive source graph");
+  }
+
   private Set<Label> getTargets(String commitBefore, String targets) throws Exception {
     return getTargets(commitBefore, targets, false, true);
   }
@@ -218,9 +234,19 @@ public class TargetDeterminatorSpecificFlagsTest {
   }
 
   private String getOutput(String commitBefore, String targets, boolean enforceClean, boolean deleteCachedWorktree, List<String> flags) throws Exception {
+    return getResult(testDir, commitBefore, targets, enforceClean, deleteCachedWorktree, flags).stdout();
+  }
+
+  private TargetDeterminator.Result getResult(
+      Path workspace,
+      String commitBefore,
+      String targets,
+      boolean enforceClean,
+      boolean deleteCachedWorktree,
+      List<String> flags) throws Exception {
     final List<String> args = Stream.concat(
         Stream.of("--working-directory",
-            testDir.toString(),
+            workspace.toString(),
             "--bazel", "bazelisk",
             "--targets", targets,
             "--nocache_results"
@@ -234,6 +260,75 @@ public class TargetDeterminatorSpecificFlagsTest {
       args.add("--delete-cached-worktree");
     }
     args.add(commitBefore);
-    return TargetDeterminator.getOutput(testDir, args.toArray(new String[0]));
+    return TargetDeterminator.getResult(workspace, args.toArray(new String[0]));
+  }
+
+  private void assertOptimizedMatchesFullHashingAfterLocalCommit(
+      WorkspaceChange workspaceChange,
+      String targets,
+      Set<String> expectedTargets,
+      String optimizedPathLog) throws Exception {
+    Path optimizedDir = Files.createTempDirectory("target-determinator-optimized-parity");
+    Path fullHashDir = Files.createTempDirectory("target-determinator-full-hash-parity");
+    try {
+      testdataRepo.cloneTo(optimizedDir);
+      testdataRepo.cloneTo(fullHashDir);
+      TestdataRepo.gitCheckout(optimizedDir, Commits.ONE_TEST_BAZEL7_0_0);
+      TestdataRepo.gitCheckout(fullHashDir, Commits.ONE_TEST_BAZEL7_0_0);
+      workspaceChange.apply(optimizedDir);
+      workspaceChange.apply(fullHashDir);
+      Files.createFile(fullHashDir.resolve("untracked-file"));
+
+      TargetDeterminator.Result optimized =
+          getResult(optimizedDir, Commits.ONE_TEST_BAZEL7_0_0, targets, false, true, List.of());
+      TargetDeterminator.Result fullHash =
+          getResult(fullHashDir, Commits.ONE_TEST_BAZEL7_0_0, targets, false, true, List.of());
+
+      assertResultParity(optimized, fullHash, expectedTargets);
+      assertThat(optimized.stderr(), containsString(optimizedPathLog));
+      assertThat(
+          fullHash.stderr(),
+          containsString("Source file hash reuse disabled: failed to determine changed files"));
+    } finally {
+      FileUtils.delete(optimizedDir.toFile(), FileUtils.RECURSIVE | FileUtils.SKIP_MISSING);
+      FileUtils.delete(fullHashDir.toFile(), FileUtils.RECURSIVE | FileUtils.SKIP_MISSING);
+    }
+  }
+
+  private void assertResultParity(
+      TargetDeterminator.Result optimized,
+      TargetDeterminator.Result fullHash,
+      Set<String> expectedTargets) throws Exception {
+    Set<Label> optimizedTargets = TargetDeterminator.parseLabels(optimized.stdout());
+    Set<Label> fullHashTargets = TargetDeterminator.parseLabels(fullHash.stdout());
+    assertThat(optimizedTargets, equalTo(fullHashTargets));
+    Util.assertTargetsMatch(optimizedTargets, expectedTargets, Set.of(), false);
+  }
+
+  private void commitUnusedFile(Path workspace) throws Exception {
+    Path unusedFile = workspace.resolve("unused-file-outside-bazel-graph.txt");
+    Files.writeString(unusedFile, "not referenced by any target\n");
+    commitPath(workspace, unusedFile.getFileName().toString(), "Add unused file outside Bazel graph");
+  }
+
+  private void commitModifiedExampleTest(Path workspace) throws Exception {
+    Path sourceFile = workspace.resolve("java/example/ExampleTest.java");
+    Files.writeString(sourceFile, Files.readString(sourceFile) + "\n// target-determinator parity test\n");
+    commitPath(workspace, "java/example/ExampleTest.java", "Modify example test source");
+  }
+
+  private void commitPath(Path workspace, String filePattern, String message) throws Exception {
+    try (Git git = Git.open(workspace.toFile())) {
+      git.add().addFilepattern(filePattern).call();
+      git.commit()
+          .setAuthor("Target Determinator Test", "target-determinator@example.invalid")
+          .setCommitter("Target Determinator Test", "target-determinator@example.invalid")
+          .setMessage(message)
+          .call();
+    }
+  }
+
+  private interface WorkspaceChange {
+    void apply(Path workspace) throws Exception;
   }
 }
